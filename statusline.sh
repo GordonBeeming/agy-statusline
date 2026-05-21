@@ -110,7 +110,10 @@ cat "$CACHE_FILE" 2>/dev/null || true
       branch_emoji="🌿"
       branch_names=()
       if command -v but &>/dev/null; then
-        but_json=$(cd "${cwd:-.}" 2>/dev/null && timeout 1 but branch list --no-check --no-ahead --json 2>/dev/null || echo '{}')
+        local cmd_timeout=""
+        if command -v timeout &>/dev/null; then cmd_timeout="timeout 1"
+        elif command -v gtimeout &>/dev/null; then cmd_timeout="gtimeout 1"; fi
+        but_json=$(cd "${cwd:-.}" 2>/dev/null && ${cmd_timeout} but branch list --no-check --no-ahead --json 2>/dev/null || echo '{}')
         while IFS= read -r b; do
           [[ -n "$b" ]] && branch_names+=("$b")
         done < <(echo "$but_json" | jq -r '.appliedStacks[].heads[].name' 2>/dev/null || true)

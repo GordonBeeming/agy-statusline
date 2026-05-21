@@ -75,6 +75,7 @@ After running the installer, add this to your `~/.gemini/antigravity-cli/setting
 
 - [jq](https://jqlang.github.io/jq/) — for parsing JSON input and GitButler output
 - [bc](https://www.gnu.org/software/bc/) — for floating-point calculations in the status line
+- `git`, `tput`, `seq` — standard command line utilities used for repository and terminal info
 - [GitButler CLI](https://docs.gitbutler.com/cli-overview) (`but`) — optional, for GitButler branch display
 
 ## Currency Configuration
