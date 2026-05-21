@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="${HOME}/.gemini/antigravity-cli/scripts"
+REPO_URL="https://raw.githubusercontent.com/gordonbeeming/agy-statusline/main/statusline.sh"
+
+echo "=== Antigravity Statusline Installer ==="
+echo ""
+
+
+
+# --- Install statusline.sh ---
+echo "Installing statusline.sh to ${INSTALL_DIR}..."
+mkdir -p "$INSTALL_DIR"
+
+tmp=$(mktemp)
+if curl -f -sSL "$REPO_URL" -o "$tmp"; then
+  cp "$tmp" "${INSTALL_DIR}/statusline.sh"
+  chmod +x "${INSTALL_DIR}/statusline.sh"
+  echo "  Installed successfully."
+else
+  echo "  Failed to download. Falling back to local copy..."
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "${SCRIPT_DIR}/statusline.sh" ]]; then
+    cp "${SCRIPT_DIR}/statusline.sh" "${INSTALL_DIR}/statusline.sh"
+    chmod +x "${INSTALL_DIR}/statusline.sh"
+    echo "  Installed from local copy."
+  else
+    echo "  ERROR: No statusline.sh found to install."
+    exit 1
+  fi
+fi
+rm -f "$tmp"
+
+# Write initial update marker
+echo "$(date +%s)" > "${INSTALL_DIR}/.statusline-last-update"
+
+echo ""
+echo "=== Installation complete ==="
+echo ""
+echo "Add this to your ~/.gemini/antigravity-cli/settings.json:"
+echo ""
+echo '  "statusLine": {'
+echo '    "type": "command",'
+echo '    "command": "~/.gemini/antigravity-cli/scripts/statusline.sh"'
+echo '  }'
+echo ""
+echo "The script will auto-update from main once per day."
