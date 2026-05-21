@@ -1,7 +1,7 @@
 #!/bin/bash
 # High-performance asynchronous statusline for agy
 
-CACHE_FILE="/Users/gordonbeeming/.gemini/antigravity-cli/scripts/.statusline-cache-output"
+CACHE_FILE="${HOME}/.gemini/antigravity-cli/scripts/.statusline-cache-output"
 LOCK_FILE="${CACHE_FILE}.lock"
 
 # 1. Print the cached output immediately to stdout so the UI renders instantly
@@ -44,8 +44,9 @@ cat "$CACHE_FILE" 2>/dev/null || true
     format_cost() {
       local val="$1"
       local is_daily="${2:-}"
+      local sym="${STATUSLINE_CURRENCY:-A$}"
       if (( $(echo "$val == 0" | bc -l) )); then
-        echo -e "${DIM}A\$0.00${RESET}"
+        echo -e "${DIM}${sym}0.00${RESET}"
       else
         local color="$GREEN"
         if [[ "$is_daily" == "daily" ]]; then
@@ -55,7 +56,7 @@ cat "$CACHE_FILE" 2>/dev/null || true
           if (( $(echo "$val >= 1.0" | bc -l) )); then color="$RED";
           elif (( $(echo "$val >= 0.5" | bc -l) )); then color="$YELLOW"; fi
         fi
-        echo -e "${color}A\$${val}${RESET}"
+        echo -e "${color}${sym}${val}${RESET}"
       fi
     }
     
@@ -262,6 +263,19 @@ cat "$CACHE_FILE" 2>/dev/null || true
     echo -e "$output" > "${CACHE_FILE}.tmp"
     mv "${CACHE_FILE}.tmp" "$CACHE_FILE"
     rm -f "$LOCK_FILE"
+
+    # Auto-update logic
+    MARKER_FILE="${HOME}/.gemini/antigravity-cli/scripts/.statusline-last-update"
+    if [[ -f "$MARKER_FILE" ]]; then
+      last_update=$(cat "$MARKER_FILE" 2>/dev/null || echo 0)
+      now=$(date +%s)
+      if (( now - last_update > 86400 )); then
+        echo "$now" > "$MARKER_FILE"
+        curl -sSL "https://raw.githubusercontent.com/gordonbeeming/agy-statusline/main/statusline.sh" -o "${HOME}/.gemini/antigravity-cli/scripts/statusline.sh.tmp" && \
+        mv "${HOME}/.gemini/antigravity-cli/scripts/statusline.sh.tmp" "${HOME}/.gemini/antigravity-cli/scripts/statusline.sh" && \
+        chmod +x "${HOME}/.gemini/antigravity-cli/scripts/statusline.sh"
+      fi
+    fi
   fi
 ) <&0 >/dev/null 2>&1 &
 
