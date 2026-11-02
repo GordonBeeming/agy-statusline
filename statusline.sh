@@ -14,25 +14,48 @@ cat "$CACHE_FILE" 2>/dev/null || true
   # Read the full JSON payload from stdin to prevent agy from blocking or erroring
   payload=$(cat)
   
+  # Remove stale lock file if older than 10 seconds
+  if [[ -f "$LOCK_FILE" ]]; then
+    now=$(date +%s)
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      lock_mtime=$(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0)
+    else
+      lock_mtime=$(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0)
+    fi
+    if (( now - lock_mtime > 10 )); then
+      rm -f "$LOCK_FILE" 2>/dev/null || true
+    fi
+  fi
+
   # Try to acquire the lock to prevent concurrent heavy computations
   if ( set -o noclobber; > "$LOCK_FILE" ) 2>/dev/null; then
-    # We have the lock. Parse the payload and do the computation.
-    
-    # Extract fields using jq
-    model_name=$(echo "$payload" | jq -r '.model // empty' 2>/dev/null)
-    effort_level=$(echo "$payload" | jq -r '.effort // empty' 2>/dev/null)
-    thinking_enabled=$(echo "$payload" | jq -r '.thinking // empty' 2>/dev/null)
-    session_cost_usd=$(echo "$payload" | jq -r '.sessionCost // empty' 2>/dev/null)
-    daily_cost=$(echo "$payload" | jq -r '.dailyCost // empty' 2>/dev/null)
-    currency_rate=$(echo "$payload" | jq -r '.currencyRate // empty' 2>/dev/null)
-    total_input=$(echo "$payload" | jq -r '.totalInputTokens // empty' 2>/dev/null)
-    total_output=$(echo "$payload" | jq -r '.totalOutputTokens // empty' 2>/dev/null)
-    cwd=$(echo "$payload" | jq -r '.cwd // empty' 2>/dev/null)
-    five_hour_pct=$(echo "$payload" | jq -r '.fiveHourRateLimitPercent // empty' 2>/dev/null)
-    five_hour_resets=$(echo "$payload" | jq -r '.fiveHourRateLimitResetsAt // empty' 2>/dev/null)
-    duration_ms=$(echo "$payload" | jq -r '.durationMs // empty' 2>/dev/null)
-    ctx_pct=$(echo "$payload" | jq -r '.contextWindowPercent // empty' 2>/dev/null)
-    ctx_size=$(echo "$payload" | jq -r '.contextWindowSize // empty' 2>/dev/null)
+    trap 'rm -f "$LOCK_FILE"' EXIT HUP INT TERM
+
+    # Helper function to check if a value is present and non-null/non-empty
+    is_valid_val() {
+      local val="$1"
+      [[ -n "$val" && "$val" != "null" && "$val" != "empty" ]]
+    }
+
+    # Extract fields using jq with fallback paths for agy/antigravity CLI formats
+    model_name=$(echo "$payload" | jq -r '.model | if type == "object" then (.display_name // .id // empty) elif type == "string" then . else empty end' 2>/dev/null || true)
+    effort_level=$(echo "$payload" | jq -r '.effort // .model.effort | if type == "string" then . elif type == "number" or type == "boolean" then tostring else empty end' 2>/dev/null || true)
+    thinking_enabled=$(echo "$payload" | jq -r '.thinking // .model.thinking // empty' 2>/dev/null || true)
+    session_cost_usd=$(echo "$payload" | jq -r '.sessionCost // .session_cost // .cost // empty' 2>/dev/null || true)
+    daily_cost=$(echo "$payload" | jq -r '.dailyCost // .daily_cost // empty' 2>/dev/null || true)
+    currency_rate=$(echo "$payload" | jq -r '.currencyRate // .currency_rate // empty' 2>/dev/null || true)
+    total_input=$(echo "$payload" | jq -r '.totalInputTokens // .total_input_tokens // .context_window.total_input_tokens // empty' 2>/dev/null || true)
+    total_output=$(echo "$payload" | jq -r '.totalOutputTokens // .total_output_tokens // .context_window.total_output_tokens // empty' 2>/dev/null || true)
+    cwd=$(echo "$payload" | jq -r '.cwd // .workspace.current_dir // empty' 2>/dev/null || true)
+    five_hour_pct=$(echo "$payload" | jq -r '.fiveHourRateLimitPercent // .five_hour_rate_limit_percent // (if .quota["gemini-5h"].remaining_fraction != null then ((1.0 - .quota["gemini-5h"].remaining_fraction) * 100) elif .quota["3p-5h"].remaining_fraction != null then ((1.0 - .quota["3p-5h"].remaining_fraction) * 100) else empty end)' 2>/dev/null || true)
+    five_hour_resets=$(echo "$payload" | jq -r '.fiveHourRateLimitResetsAt // .five_hour_rate_limit_resets_at // (if .quota["gemini-5h"].reset_in_seconds != null then (now + .quota["gemini-5h"].reset_in_seconds) elif .quota["3p-5h"].reset_in_seconds != null then (now + .quota["3p-5h"].reset_in_seconds) else empty end)' 2>/dev/null || true)
+    duration_ms=$(echo "$payload" | jq -r '.durationMs // .duration_ms // empty' 2>/dev/null || true)
+    ctx_pct=$(echo "$payload" | jq -r '.contextWindowPercent // .context_window_percent // .context_window.used_percentage // empty' 2>/dev/null || true)
+    ctx_size=$(echo "$payload" | jq -r '.contextWindowSize // .context_window_size // .context_window.context_window_size // empty' 2>/dev/null || true)
+
+    if ! is_valid_val "$currency_rate" || [[ "$currency_rate" == "0" ]]; then
+      currency_rate=1
+    fi
 
     # Formatting utilities
     RESET="\033[0m"
@@ -45,16 +68,26 @@ cat "$CACHE_FILE" 2>/dev/null || true
       local val="$1"
       local is_daily="${2:-}"
       local sym="${STATUSLINE_CURRENCY:-A$}"
-      if (( $(echo "$val == 0" | bc -l) )); then
+      
+      local is_zero
+      is_zero=$(awk -v v="$val" 'BEGIN { print (v == 0 ? 1 : 0) }' 2>/dev/null || echo 1)
+      
+      if [[ "$is_zero" -eq 1 ]]; then
         echo -e "${DIM}${sym}0.00${RESET}"
       else
         local color="$GREEN"
         if [[ "$is_daily" == "daily" ]]; then
-          if (( $(echo "$val >= 5.0" | bc -l) )); then color="$RED";
-          elif (( $(echo "$val >= 2.0" | bc -l) )); then color="$YELLOW"; fi
+          local ge5 ge2
+          ge5=$(awk -v v="$val" 'BEGIN { print (v >= 5.0 ? 1 : 0) }' 2>/dev/null || echo 0)
+          ge2=$(awk -v v="$val" 'BEGIN { print (v >= 2.0 ? 1 : 0) }' 2>/dev/null || echo 0)
+          if [[ "$ge5" -eq 1 ]]; then color="$RED";
+          elif [[ "$ge2" -eq 1 ]]; then color="$YELLOW"; fi
         else
-          if (( $(echo "$val >= 1.0" | bc -l) )); then color="$RED";
-          elif (( $(echo "$val >= 0.5" | bc -l) )); then color="$YELLOW"; fi
+          local ge1 ge05
+          ge1=$(awk -v v="$val" 'BEGIN { print (v >= 1.0 ? 1 : 0) }' 2>/dev/null || echo 0)
+          ge05=$(awk -v v="$val" 'BEGIN { print (v >= 0.5 ? 1 : 0) }' 2>/dev/null || echo 0)
+          if [[ "$ge1" -eq 1 ]]; then color="$RED";
+          elif [[ "$ge05" -eq 1 ]]; then color="$YELLOW"; fi
         fi
         echo -e "${color}${sym}${val}${RESET}"
       fi
@@ -63,7 +96,11 @@ cat "$CACHE_FILE" 2>/dev/null || true
     make_bar() {
       local pct="$1"
       local width="$2"
+      (( pct < 0 )) && pct=0
+      (( pct > 100 )) && pct=100
       local filled=$(( pct * width / 100 ))
+      (( filled < 0 )) && filled=0
+      (( filled > width )) && filled=width
       local empty=$(( width - filled ))
       local color="$GREEN"
       if (( pct > 90 )); then color="$RED"
@@ -91,7 +128,7 @@ cat "$CACHE_FILE" 2>/dev/null || true
     if toplevel=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null); then
       repo_name=$(basename "$toplevel")
       in_git_repo=true
-    elif [[ -n "$cwd" ]]; then
+    elif is_valid_val "$cwd"; then
       repo_name=$(basename "$cwd")
     else
       repo_name=$(basename "$(pwd -P 2>/dev/null || pwd 2>/dev/null || true)")
@@ -166,10 +203,10 @@ cat "$CACHE_FILE" 2>/dev/null || true
 
     # Formatting blocks
     model_display=""
-    [[ -n "$model_name" ]] && model_display="🤖 ${model_name}"
+    is_valid_val "$model_name" && model_display="🤖 ${model_name}"
 
     effort_display=""
-    if [[ -n "$effort_level" ]]; then
+    if is_valid_val "$effort_level"; then
       case "$effort_level" in
         low)       effort_display=$(printf '⚡ %b%s%b' "$DIM" "$effort_level" "$RESET") ;;
         medium)    effort_display="⚡ ${effort_level}" ;;
@@ -183,55 +220,75 @@ cat "$CACHE_FILE" 2>/dev/null || true
     [[ "$thinking_enabled" == "true" ]] && thinking_display="🤔"
 
     session_cost_local=""
-    if [[ "$session_cost_usd" != "0" && "$session_cost_usd" != "null" ]]; then
-      session_cost_val=$(echo "$session_cost_usd $currency_rate" | awk '{printf "%.2f", $1 * $2}')
-      session_cost_local="💸 $(format_cost "$session_cost_val") session"
+    if is_valid_val "$session_cost_usd" && [[ "$session_cost_usd" != "0" ]]; then
+      session_cost_val=$(echo "$session_cost_usd $currency_rate" | awk '{printf "%.2f", $1 * $2}' 2>/dev/null || echo "0.00")
+      if [[ "$session_cost_val" != "0.00" ]]; then
+        session_cost_local="💸 $(format_cost "$session_cost_val") session"
+      fi
     fi
 
     daily_cost_display=""
-    if [[ "$daily_cost" != "0" && "$daily_cost" != "null" ]]; then
-      daily_cost_val=$(echo "$daily_cost $currency_rate" | awk '{printf "%.2f", $1 * $2}')
-      daily_cost_display="💰 $(format_cost "$daily_cost_val" daily) today"
+    if is_valid_val "$daily_cost" && [[ "$daily_cost" != "0" ]]; then
+      daily_cost_val=$(echo "$daily_cost $currency_rate" | awk '{printf "%.2f", $1 * $2}' 2>/dev/null || echo "0.00")
+      if [[ "$daily_cost_val" != "0.00" ]]; then
+        daily_cost_display="💰 $(format_cost "$daily_cost_val" daily) today"
+      fi
     fi
 
     rate_display=""
-    if [[ -n "$five_hour_pct" && "$five_hour_pct" != "null" ]]; then
+    if is_valid_val "$five_hour_pct"; then
       pct_int=${five_hour_pct%.*}
-      bar=$(make_bar "$pct_int" 10)
-      time_left=""
-      if [[ -n "$five_hour_resets" && "$five_hour_resets" != "null" ]]; then
-        now_ts=$(date +%s)
-        remaining=$(( ${five_hour_resets%.*} - now_ts ))
-        if (( remaining > 0 )); then
-          hours_left=$(( remaining / 3600 ))
-          mins_left=$(( (remaining % 3600) / 60 ))
-          time_left=" ${hours_left}h${mins_left}m left"
+      if [[ -n "$pct_int" ]]; then
+        bar=$(make_bar "$pct_int" 10)
+        time_left=""
+        if is_valid_val "$five_hour_resets"; then
+          now_ts=$(date +%s)
+          resets_int=${five_hour_resets%.*}
+          if [[ -n "$resets_int" ]]; then
+            remaining=$(( resets_int - now_ts ))
+            if (( remaining > 0 )); then
+              hours_left=$(( remaining / 3600 ))
+              mins_left=$(( (remaining % 3600) / 60 ))
+              time_left=" ${hours_left}h${mins_left}m left"
+            fi
+          fi
         fi
+        rate_display="⏱️ ${bar} ${pct_int}%${time_left}"
       fi
-      rate_display="⏱️ ${bar} ${pct_int}%${time_left}"
-    elif [[ "$duration_ms" != "0" && "$duration_ms" != "null" ]]; then
-      duration_secs=$(( ${duration_ms%.*} / 1000 ))
-      if (( duration_secs > 0 )); then
-        hours=$(( duration_secs / 3600 ))
-        mins=$(( (duration_secs % 3600) / 60 ))
-        rate_display="⏱️ ${hours}h${mins}m"
+    elif is_valid_val "$duration_ms" && [[ "$duration_ms" != "0" ]]; then
+      dur_int=${duration_ms%.*}
+      if [[ -n "$dur_int" && "$dur_int" -gt 0 ]]; then
+        duration_secs=$(( dur_int / 1000 ))
+        if (( duration_secs > 0 )); then
+          hours=$(( duration_secs / 3600 ))
+          mins=$(( (duration_secs % 3600) / 60 ))
+          rate_display="⏱️ ${hours}h${mins}m"
+        fi
       fi
     fi
 
     ctx_display=""
-    if [[ "$ctx_size" != "0" && "$ctx_size" != "null" ]]; then
-      ctx_int=${ctx_pct%.*}
-      if (( ctx_int > 0 )); then
-        ctx_bar=$(make_bar "$ctx_int" 10)
-        ctx_display="💭 ${ctx_bar} ${ctx_int}% ctx"
+    if is_valid_val "$ctx_size" && [[ "$ctx_size" != "0" ]]; then
+      if is_valid_val "$ctx_pct"; then
+        ctx_int=${ctx_pct%.*}
+        if [[ -n "$ctx_int" ]] && (( ctx_int > 0 )); then
+          ctx_bar=$(make_bar "$ctx_int" 10)
+          ctx_display="💭 ${ctx_bar} ${ctx_int}% ctx"
+        fi
       fi
     fi
 
     token_display=""
-    if [[ "$total_input" != "0" && "$total_input" != "null" && "${total_input%.*}" -gt 0 ]]; then
-      in_k=$(( ${total_input%.*} / 1000 ))
-      out_k=$(( ${total_output%.*} / 1000 ))
-      token_display="🧠 ${in_k}k in / ${out_k}k out"
+    if is_valid_val "$total_input"; then
+      inp_int=${total_input%.*}
+      out_int=${total_output%.*}
+      inp_int=${inp_int:-0}
+      out_int=${out_int:-0}
+      if (( inp_int > 0 )); then
+        in_k=$(( inp_int / 1000 ))
+        out_k=$(( out_int / 1000 ))
+        token_display="🧠 ${in_k}k in / ${out_k}k out"
+      fi
     fi
 
     # Assemble lines
@@ -262,10 +319,9 @@ cat "$CACHE_FILE" 2>/dev/null || true
     if (( ${#line3_parts[@]} > 0 )); then [[ -n "$output" ]] && output+=$'\n'; output+=$(join_parts "${line3_parts[@]}"); fi
     if (( ${#line4_parts[@]} > 0 )); then [[ -n "$output" ]] && output+=$'\n'; output+=$(join_parts "${line4_parts[@]}"); fi
 
-    # Save to cache and release lock
+    # Save to cache
     echo -e "$output" > "${CACHE_FILE}.tmp"
     mv "${CACHE_FILE}.tmp" "$CACHE_FILE"
-    rm -f "$LOCK_FILE"
 
     # Auto-update logic
     MARKER_FILE="${HOME}/.gemini/antigravity-cli/scripts/.statusline-last-update"
@@ -274,7 +330,7 @@ cat "$CACHE_FILE" 2>/dev/null || true
       now=$(date +%s)
       if (( now - last_update > 86400 )); then
         echo "$now" > "$MARKER_FILE"
-        curl -sSL "https://raw.githubusercontent.com/gordonbeeming/agy-statusline/main/statusline.sh" -o "${HOME}/.gemini/antigravity-cli/scripts/statusline.sh.tmp" && \
+        curl -sSL "https://raw.githubusercontent.com/GordonBeeming/agy-statusline/main/statusline.sh" -o "${HOME}/.gemini/antigravity-cli/scripts/statusline.sh.tmp" && \
         mv "${HOME}/.gemini/antigravity-cli/scripts/statusline.sh.tmp" "${HOME}/.gemini/antigravity-cli/scripts/statusline.sh" && \
         chmod +x "${HOME}/.gemini/antigravity-cli/scripts/statusline.sh"
       fi
